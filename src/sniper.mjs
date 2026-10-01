@@ -138,6 +138,19 @@ async function marketState(market) {
   return { market, phase, active, opening, realQuote, realTokens, gradQuote, tSold, founderCap, ticket, ticketTokens, token, quote };
 }
 
+// token metadata: name/symbol/decimals + the on-chain JSON metadataURI ({image,avatar,description})
+async function tokenInfo(token) {
+  const [name, symbol, decimals, metaUri] = await Promise.all([
+    pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'name' }).catch(() => ''),
+    pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'symbol' }).catch(() => ''),
+    pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'decimals' }).catch(() => 18),
+    pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'metadataURI' }).catch(() => null),
+  ]);
+  let image = '', avatar = '', description = '';
+  if (metaUri) { try { const m = JSON.parse(metaUri); image = m.image || ''; avatar = m.avatar || ''; description = m.description || ''; } catch {} }
+  return { name, symbol, decimals: Number(decimals), image, avatar, description };
+}
+
 // ---------- arming ----------
 async function arm(market, w, { nonce, fees, amount, deadline } = {}) {
   const account = w.account;
@@ -224,7 +237,11 @@ async function cmdScan() {
     const c = await factoryLaunch(FACTORY, i);
     const s = await marketState(c.market).catch(() => ({}));
     const mc = await readMarketCap(pub, c.market).catch(() => null);
-    console.log(`#${i} ${c.market} phase=${s.phase} active=${s.active} opening=${s.opening} mc=${mc ? mcap(mc.cap) : '?'} token=${c.token} lev=${c.leverage}x${c.shortThesis ? ' short' : ''}`);
+    const ti = await tokenInfo(c.token).catch(() => ({}));
+    const nm = ti.name ? `${ti.name} ($${ti.symbol})` : '';
+    const desc = ti.description ? `  "${ti.description}"` : '';
+    console.log(`#${i} ${nm} ${c.market} phase=${s.phase} active=${s.active} opening=${s.opening} mc=${mc ? mcap(mc.cap) : '?'} token=${c.token} lev=${c.leverage}x${c.shortThesis ? ' short' : ''}`);
+    if (desc || ti.image) console.log(`     ${desc}${ti.image ? `  ${ti.image}` : ''}`);
   }
 }
 
@@ -233,6 +250,10 @@ async function cmdMonitor() {
   const s = await marketState(MARKET);
   const mc = await readMarketCap(pub, MARKET).catch(() => null);
   if (mc) { s.marketCap = mc.cap; s.unitPrice = mc.unit; s.totalSupply = mc.supply; }
+  if (s.token) {
+    const ti = await tokenInfo(s.token).catch(() => null);
+    if (ti) { s.tokenName = ti.name; s.tokenSymbol = ti.symbol; s.description = ti.description; s.image = ti.image; s.avatar = ti.avatar; }
+  }
   console.log(JSON.stringify(s, (k, v) => (typeof v === 'bigint' ? v.toString() : v), 2));
 }
 
@@ -592,10 +613,14 @@ async function cmdSnipe() {
         onError: (e) => log('ws log err', e.message),
       }));
       // FoundingFinalized fires just before CurveOpened when the founding round ends — on SOLD OUT
-      // (333/333) it can happen well before the scheduled open, so treat it as an early trigger too.
+      // (333/333) it can happen well before the scheduled open. GATE on phase>=1 so we never fire
+      // while the curve is still closed (a premature fire would set `fired` and block the real shot).
       cleanups.push(wspub.watchContractEvent({
         address: market, abi: MARKET_ABI, eventName: 'FoundingFinalized',
-        onLogs: () => { log('ws:FoundingFinalized — founding closed, curve imminent'); triggerOnce('ws:FoundingFinalized'); },
+        onLogs: async () => {
+          log('ws:FoundingFinalized — founding closed');
+          try { const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' }); if (Number(p) >= 1) triggerOnce('ws:FoundingFinalized'); else log('phase still 0 after FoundingFinalized — waiting for phase 1'); } catch {}
+        },
         onError: (e) => log('ws finalize err', e.message),
       }));
       cleanups.push(wspub.watchBlocks({

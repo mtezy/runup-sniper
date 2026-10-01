@@ -114,4 +114,7 @@ export const ERC20_ABI = [
   { type: 'function', name: 'symbol', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
   { type: 'function', name: 'name', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
   { type: 'function', name: 'totalSupply', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
+  // RUNUP coins carry their off-chain metadata as a JSON string on the token:
+  //   metadataURI() -> '{"image":"https://...","description":"...","avatar":"rocket"}'
+  { type: 'function', name: 'metadataURI', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
 ];

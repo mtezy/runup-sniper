@@ -57,14 +57,19 @@ const log = (...a) => console.log(new Date().toISOString().slice(11, 23), ...a);
 // ---------- enrich ----------
 async function tokenMeta(token) {
   try {
-    const [name, symbol, decimals, supply] = await Promise.all([
+    const [name, symbol, decimals, supply, metaUri] = await Promise.all([
       pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'name' }).catch(() => ''),
       pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'symbol' }).catch(() => ''),
       pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'decimals' }).catch(() => 18),
       pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'totalSupply' }).catch(() => null),
+      pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'metadataURI' }).catch(() => null),
     ]);
-    return { name, symbol, decimals: Number(decimals), supply };
-  } catch { return { name: '', symbol: '', decimals: 18, supply: null }; }
+    let image = '', avatar = '', description = '';
+    if (metaUri) {
+      try { const m = JSON.parse(metaUri); image = m.image || ''; avatar = m.avatar || ''; description = m.description || ''; } catch {}
+    }
+    return { name, symbol, decimals: Number(decimals), supply, image, avatar, description };
+  } catch { return { name: '', symbol: '', decimals: 18, supply: null, image: '', avatar: '', description: '' }; }
 }
 
 async function marketMeta(market) {
@@ -105,6 +110,9 @@ async function buildAlert({ index, creator, market, token, vault, schedule, adap
   lines.push(`🆕 <b>NEW RUNUP LAUNCH</b>  #${index}`);
   lines.push('');
   lines.push(`<b>${esc(name)}</b> ${esc(sym)}`);
+  if (meta.description) lines.push(`<i>${esc(meta.description)}</i>`);
+  if (meta.image) lines.push(`🖼 <a href="${meta.image}">artwork</a>`);
+  else if (meta.avatar) lines.push(`🖼 avatar  <code>${esc(meta.avatar)}</code>`);
   lines.push(`market  <code>${market}</code>`);
   lines.push(`token   <code>${token}</code>`);
   lines.push(`creator <code>${creator}</code>`);
@@ -159,21 +167,61 @@ async function backfill(fromIndex = 0) {
   }
 }
 
-// ---------- MC surge ----------
+// ---------- MC surge (metadata-enriched) ----------
 const samples = new Map();   // market(lower) -> [{t, mc}]
 const lastSurge = new Map(); // market(lower) -> ts
 
-function surgeMsg(m, from, to, pct, mins) {
-  const sym = m.symbol ? '$' + esc(m.symbol) : 'token';
-  const lines = [];
-  lines.push(`🚀 <b>MC SURGE</b>  ${sym}`);
-  lines.push('');
-  lines.push(`MC  ${mcap(from)} → <b>${mcap(to)}</b>  (<b>+${pct.toFixed(0)}%</b> in ${mins}m)`);
-  lines.push(`market  <code>${m.market}</code>`);
-  if (m.token) lines.push(`token   <code>${m.token}</code>`);
-  lines.push('');
-  lines.push(`<a href="https://runup.fun/coin/${m.market}">runup.fun/coin/…</a>  ·  <a href="https://blockscout.injective.network/address/${m.market}">explorer</a>`);
-  return lines.join('\n');
+const SPARK = '▁▂▃▄▅▆▇█';
+function spark(vals) {
+  if (!vals || vals.length < 2) return '';
+  const min = Math.min(...vals), max = Math.max(...vals), rng = (max - min) || 1;
+  return vals.map(v => SPARK[Math.min(7, Math.max(0, Math.round(((v - min) / rng) * 7)))]).join('');
+}
+const PHASE_NAME = { 0: 'founding', 1: 'active (curve)', 2: 'graduated' };
+const usdN = (raw, dec = 6) => Number(formatUnits(raw, dec));
+const usdFmt = (n) => n.toLocaleString('en-US', { maximumFractionDigits: n < 100 ? 2 : 0 });
+
+// pull a full metadata bundle for a market (token + curve state + MC)
+async function richMarket(market, token) {
+  const q = (fn) => pub.readContract({ address: market, abi: MARKET_ABI, functionName: fn }).catch(() => null);
+  const [meta, phase, active, opening, ticket, ticketTokens, gradQuote, ticketsSold, founderCap, realQuote, creator, preset, feeBps] = await Promise.all([
+    tokenMeta(token), q('phase'), q('active'), q('opening'), q('TICKET'), q('TICKET_TOKENS'), q('graduationQuote'),
+    q('ticketsSold'), q('founderCount'), q('realQuote'), q('creator'), q('preset'), q('FEE_BPS'),
+  ]);
+  const mc = await readMarketCap(pub, market).catch(() => null);
+  return { meta, phase, active, opening, ticket, ticketTokens, gradQuote, ticketsSold, founderCap, realQuote, creator, preset, feeBps, mc };
+}
+
+async function surgeMsg(m, from, to, pct, mins, hist) {
+  const rich = await richMarket(m.market, m.token).catch(() => null);
+  const meta = rich?.meta || {};
+  const name = meta.name || '(unknown)';
+  const sym = meta.symbol || m.symbol || '';
+  const ph = rich?.phase != null ? Number(rich.phase) : null;
+  const L = [];
+  L.push(`🚀 <b>MC SURGE</b>  <b>${esc(name)}</b> ${sym ? '$' + esc(sym) : ''}`);
+  if (meta.description) L.push(`<i>${esc(meta.description)}</i>`);
+  L.push('');
+  L.push(`📈 <b>${mcap(from)} → ${mcap(to)}</b>  (<b>+${pct.toFixed(0)}%</b> in ${mins}m)`);
+  if (hist && hist.length > 1) L.push(`<code>${spark(hist)}</code>  <i>${mcap(Math.min(...hist))} – ${mcap(Math.max(...hist))}</i>`);
+  if (rich?.mc) L.push(`💲 price  ${rich.mc.unit < 0.001 ? rich.mc.unit.toPrecision(3) : rich.mc.unit.toFixed(6)} USDC/tok`);
+  if (ph != null) L.push(`⚙️ phase  ${ph} · ${esc(PHASE_NAME[ph] || '?')}`);
+  if (ph === 0 && rich?.founderCap) {
+    const sold = Number(rich.ticketsSold || 0), cap = Number(rich.founderCap);
+    L.push(`🎟️ founding  <b>${sold}/${cap}</b>  (${((sold / cap) * 100).toFixed(1)}% — sold out → early open)`);
+  }
+  if (rich?.realQuote != null && rich?.gradQuote != null && Number(rich.gradQuote) > 0) {
+    const rq = usdN(rich.realQuote), gq = usdN(rich.gradQuote);
+    L.push(`💧 curve  ${usdFmt(rq)} / ${usdFmt(gq)} USDC  (${((rq / gq) * 100).toFixed(1)}% to grad)`);
+  }
+  if (rich?.feeBps) L.push(`🧾 fee  ${(Number(rich.feeBps) / 100).toFixed(2)}%`);
+  L.push('');
+  L.push(`market  <code>${m.market}</code>`);
+  if (m.token) L.push(`token   <code>${m.token}</code>`);
+  if (rich?.creator) L.push(`creator <code>${rich.creator}</code>`);
+  L.push('');
+  L.push(`<a href="https://runup.fun/coin/${m.market}">runup.fun/coin/…</a>  ·  <a href="https://blockscout.injective.network/address/${m.market}">explorer</a>`);
+  return L.join('\n');
 }
 
 async function surgeTick() {
@@ -200,7 +248,9 @@ async function surgeTick() {
       if (pct >= SURGE_PCT && now - la > SURGE_WINDOW_MS) {
         lastSurge.set(key, now);
         const mins = Math.max(1, Math.round((now - base.t) / 60000));
-        const mid = await sendTelegram(surgeMsg(m, base.mc, mc.cap, pct, mins), { chatId: CHAT });
+        const hist = arr.filter(s => s.t >= target).map(s => s.mc);
+        const msg = await surgeMsg(m, base.mc, mc.cap, pct, mins, hist);
+        const mid = await sendTelegram(msg, { chatId: CHAT });
         log(`surge ${m.symbol || key.slice(0, 8)} +${pct.toFixed(0)}% (${mcap(base.mc)}→${mcap(mc.cap)}) -> msg ${mid ?? 'FAILED'}`);
       }
     } catch (e) { log('surge err', e.shortMessage || e.message); }
@@ -276,7 +326,8 @@ async function main() {
     const m = { market: r[1], token: r[0], symbol: sym };
     const mc = await readMarketCap(pub, m.market).catch(() => null);
     const to = mc ? mc.cap : 1500, from = to / 1.5;
-    const msg = surgeMsg(m, from, to, 50, 5);
+    const hist = [from, from * 1.05, from * 1.12, from * 1.25, from * 1.33, to];
+    const msg = await surgeMsg(m, from, to, 50, 5, hist);
     console.log(msg);
     const mid = await sendTelegram(msg, { chatId: CHAT });
     log(`test surge -> msg ${mid ?? 'FAILED'}`);

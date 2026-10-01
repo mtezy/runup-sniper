@@ -12,6 +12,9 @@ wallets*.env
 # ── logs ───────────────────────────────────────────────
 *.log
 
+# ── runtime state ──────────────────────────────────────
+.sitewatch.state.json
+
 # ── build artifacts / deps ─────────────────────────────
 node_modules/
 out/

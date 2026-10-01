@@ -66,8 +66,9 @@ phase 2  GRADUATED
 ```
 /root/runup-sniper/
   src/
-    sniper.mjs      CLI utama: config|scan|monitor|wallets|approve|buy|sell|watch|snipe
-    alerts.mjs      watcher token baru (CoinLaunched) + MC-surge → Telegram
+    sniper.mjs      CLI utama: config|scan|monitor|founders|wallets|approve|buy|sell|watch|snipe
+    alerts.mjs      watcher token baru (CoinLaunched) + MC-surge + founding/curve → Telegram
+    sitewatch.mjs   watcher bundle SPA runup.fun + Convex config (redeploy) → Telegram
     abi.mjs         FACTORY_ABI, MARKET_ABI, ERC20_ABI
     curve.mjs       readMarketCap(pub, market)  → {priceRaw, unit, supply, cap}
     fmt.mjs         warna, tabel (cols), angka (num/usd/tok), mcap()/mcapMove()
@@ -179,17 +180,22 @@ screen -S runup-alerts -X stuff 'cd /root/runup-sniper && node src/alerts.mjs >>
 🆕 NEW RUNUP LAUNCH  #0
 
 RunUp $RUNNER
+The RunUp platform token.
+🖼 artwork
 market  0x8399aF15...
 token   0xe2906863...
 creator 0x82844763...
 
 📊 MC $23.9K  ·  0.0000239 USDC/tok
 💵 20 USDC ticket  ·  826,446 tok
+🎟️ founding  31/333  (9.3% sold — sold out → curve opens early)
 ⚙️ LONG 2× · preset 3 · profile 1 · fee 1.30%
 🕐 founding opens  2026-10-01T15:30:00Z  (public +1h)
 
 runup.fun/coin/…  ·  explorer
 ```
+Token metadata (description + artwork) dibaca dari **`metadataURI()`** token (on-chain, JSON string):
+`{"image":"https://…","description":"…","avatar":"rocket"}`. Nggak ada field website/socials di skema.
 
 ### Alert 2 — MC surge
 ```
@@ -209,6 +215,35 @@ ALERT_SURGE_WINDOW_MS=300000 # window 5 menit
 ALERT_SURGE_MIN_MC=500       # abaikan MC < $500
 ALERT_SURGE_POLL_MS=30000    # cek tiap 30s
 ```
+Alert surge **metadata-enriched**: nama token + `$symbol`, MC move + sparkline, price (USDC/tok),
+phase, founding (`sold/cap`) atau curve progress (`realQuote/gradQuote` → % to grad), fee,
+market/token/creator + links.
+
+### Alert 3 — founding / curve (dari alerts.mjs)
+- founding milestone **90%** & **SOLD OUT** (`ticketsSold`/`founderCount`)
+- **🔓 CURVE OPEN** (phase 0→1) — nangkep early open pas sold-out
+- poll `ALERT_CURVE_POLL_MS` (default 8000)
+
+### Alert 4 — unified watcher frontend + onchain (`sitewatch.mjs`)
+Pantau **bundle SPA runup.fun + state on-chain** realtime → alert tiap perubahan (sinyal paling cepet
+kalau mereka update jadwal/factory/market baru):
+```bash
+node src/sitewatch.mjs --test        # sample alert
+node src/sitewatch.mjs --once        # snapshot + exit
+node src/sitewatch.mjs               # baseline + watch (screen runup-sitewatch)
+node src/sitewatch.mjs --no-chain    # frontend only
+```
+Deteksi FRONTEND:
+- **🚀 REDEPLOY** — index bundle hash berubah
+- **🏭 FACTORY LIVE** — Convex `catalog:get` dari `null` → live
+- **📦 chunk** added/removed/changed
+- **🆕 address baru** di chunk `v4Curve` (factory/quote)
+
+Deteksi ON-CHAIN:
+- **🪙 NEW LAUNCH** — `factory.count()` naik (+ market/token baru)
+- **🔓 PHASE 0→1** — curve buka (early kalau sold-out)
+- **🕐 NEW LAUNCH TIME** — `opening()` berubah (jadwal baru di-set!)
+- baseline di `.sitewatch.state.json` (gitignored) → restart nggak re-alert
 
 ---
 

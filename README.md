@@ -141,11 +141,42 @@ screen -S runup-alerts -X stuff 'cd /root/runup-sniper && node src/alerts.mjs >>
 ```
 
 - Token read from `TELEGRAM_BOT_TOKEN` (or `~/.hermes/.env`); target = `TELEGRAM_CHAT_ID` (default langris).
-- Alert shows: name/symbol, market + token + creator addresses, **market cap + unit price**, ticket price +
-  tokens, graduation target, leverage/preset/fee, founding-open time, and runup.fun + explorer links.
+- Alert shows: name/symbol, **description + artwork** (from the token's on-chain `metadataURI()` JSON), market
+  + token + creator addresses, **market cap + unit price**, ticket price + tokens, graduation target,
+  leverage/preset/fee, founding-open time, and runup.fun + explorer links.
+- **Token metadata is on-chain**: RUNUP coins carry a JSON string in the token's `metadataURI()` getter —
+  `{"image":"https://…","description":"…","avatar":"rocket"}` (description ≤ 240 chars, JSON ≤ 1024 bytes).
+  There is **no website/socials field** in the schema. `sniper.mjs` exposes it too: `monitor` adds
+  `tokenName/tokenSymbol/description/image/avatar`, `scan` prints name + description.
 - **MC-surge watcher**: polls every market's market cap (`ALERT_SURGE_POLL_MS`, default 30s) and fires a
   `🚀 MC SURGE` alert when it rises ≥ `ALERT_SURGE_PCT`% (default 25) within `ALERT_SURGE_WINDOW_MS`
   (default 5m), above `ALERT_SURGE_MIN_MC` (default $500). Per-market cooldown = one window.
+  The alert is **metadata-enriched**: token name + `$symbol`, MC move + a `<code>` sparkline, price
+  (USDC/tok), phase, founding progress (`ticketsSold/founderCount`) or curve progress
+  (`realQuote/graduationQuote` → % to graduation), fee, and market/token/creator + links.
+- **Founding / curve watcher**: polls every market (`ALERT_CURVE_POLL_MS`, default 8s) and alerts on
+  founding milestones (90% / sold out) and the phase 0→1 flip (🔓 curve open) — catches an **early open**
+  on sell-out.
+
+### Unified realtime watcher (frontend + on-chain)
+
+Watch runup.fun's SPA bundle **and** the on-chain state in realtime, alerting on ANY change — the fastest
+signal that a new launch time / factory / market is coming:
+
+```bash
+node src/sitewatch.mjs --test        # send one sample alert, exit
+node src/sitewatch.mjs --once        # snapshot once, print, exit
+node src/sitewatch.mjs               # baseline then watch live (run in screen)
+screen -dmS runup-sitewatch
+screen -S runup-sitewatch -X stuff 'cd /root/runup-sniper && node src/sitewatch.mjs >> sitewatch.log 2>&1\n'
+```
+
+- **Frontend**: index bundle hash change (🚀 redeploy), lazy chunk set changes, Convex `catalog:get`
+  going `null → live` (🏭 factory live), new deployment addresses in the `v4Curve` chunk.
+- **On-chain**: `factory.count()` increase (🪙 new launch + market/token), tracked market phase change
+  (🔓 0 founding → 1 active = curve open), and `opening()` change (🕐 **new launch time**).
+- Baseline persisted to `.sitewatch.state.json` (gitignored) so restarts don't re-alert.
+- Flags/env: `SITE`, `--interval N` (s), `--no-convex`, `--no-chain`, `--chat ID`.
 
 ### Manual buy / sell
 
