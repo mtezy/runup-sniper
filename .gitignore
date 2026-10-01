@@ -1,0 +1,23 @@
+# ── secrets — NEVER commit ─────────────────────────────
+.env
+.env.*
+!.env.example
+wallets.json
+wallets.env
+wallets*.json
+wallets*.env
+*.key
+*.pem
+
+# ── logs ───────────────────────────────────────────────
+*.log
+
+# ── build artifacts / deps ─────────────────────────────
+node_modules/
+out/
+cache/
+broadcast/
+
+# ── os / editor ────────────────────────────────────────
+.DS_Store
+*.swp
