@@ -24,7 +24,8 @@
 import 'dotenv/config';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { createPublicClient, http, fallback, defineChain } from 'viem';
-import { sendTelegram, CHAT_ID, esc } from './notify.mjs';
+import { sendAlert, CHAT_ID } from './notify.mjs';
+import { EntityBuilder } from './eb.mjs';
 import { convexConfig } from './convex.mjs';
 import { FACTORY_ABI, MARKET_ABI } from './abi.mjs';
 
@@ -160,41 +161,31 @@ function diff(prev, cur) {
   return ev;
 }
 
-const KNOWN = {
-  '0xa00C59fF5a080D2b954d0c75e46E22a0c371235a': 'USDC (quote)',
-  '0xef1a648373dC19072D692429B704Bb63cf597950': 'V4 factory',
-};
-const label = (addr) => KNOWN[addr] ? `${addr} <i>(${esc(KNOWN[addr])})</i>` : addr;
 const iso = (s) => (s ? new Date(s * 1000).toISOString().replace('.000Z', 'Z') : '?');
+const PHASE_LABEL = { 0: 'founding', 1: 'active (curve open)', 2: 'graduated' };
 
 function buildMsg(ev) {
   const f = ev.fe || {}, c = ev.ch || {};
-  const L = [];
-  L.push('🔧 <b>RUNUP UPDATE</b>  <i>frontend + onchain</i>');
-  L.push('');
+  const eb = new EntityBuilder();
+  eb.add('🔧 ').bold('RUNUP UPDATE').add('  ').italic('frontend + onchain').nl();
   // ---- frontend ----
-  if (f.redeploy) L.push(`🚀 <b>REDEPLOY</b>  index <code>${esc(f.indexOld)}</code> → <code>${esc(f.indexNew)}</code>`);
-  if (f.convexLive) L.push(`🏭 <b>FACTORY LIVE</b>  convex catalog now returns a deployment`);
-  if (f.factory) L.push(`factory  <code>${f.factory}</code>`);
-  if (f.quote) L.push(`quote    <code>${f.quote}</code>`);
-  if (f.chunkAdded?.length) L.push(`📦 +chunk  ${f.chunkAdded.map(x => `<code>${esc(x.replace('assets/', ''))}</code>`).join(' ')}`);
-  if (f.chunkRemoved?.length) L.push(`📦 −chunk  ${f.chunkRemoved.map(x => `<code>${esc(x.replace('assets/', ''))}</code>`).join(' ')}`);
-  if (f.chunkChanged?.length) L.push(`♻️ changed  ${f.chunkChanged.map(x => `<code>${esc(x.new.replace('assets/', ''))}</code>`).join(' ')}`);
-  if (f.newAddrs?.length) L.push(`🆕 addr  ${f.newAddrs.slice(0, 6).map(label).join('  ')}`);
+  if (f.redeploy) eb.add('🚀 ').bold('REDEPLOY').add('  index ').code(f.indexOld).add(' → ').code(f.indexNew).nl();
+  if (f.convexLive) eb.add('🏭 ').bold('FACTORY LIVE').add('  convex catalog now returns a deployment').nl();
+  if (f.factory) eb.add('factory ').code(f.factory).nl();
+  if (f.quote) eb.add('quote   ').code(f.quote).nl();
+  if (f.chunkAdded?.length) eb.add('📦 +chunk  ').code(f.chunkAdded.map(x => x.replace('assets/', '')).join(' ')).nl();
+  if (f.chunkRemoved?.length) eb.add('📦 −chunk  ').code(f.chunkRemoved.map(x => x.replace('assets/', '')).join(' ')).nl();
+  if (f.chunkChanged?.length) eb.add('♻️ changed  ').code(f.chunkChanged.map(x => x.new.replace('assets/', '')).join(' ')).nl();
+  if (f.newAddrs?.length) eb.add('🆕 addr  ').code(f.newAddrs.slice(0, 6).join('  ')).nl();
   // ---- on-chain ----
-  if (c.newFactory) L.push(`\n⛓️ <b>NEW FACTORY</b>  <code>${c.factoryOld}</code> → <code>${c.factoryNew}</code>`);
+  if (c.newFactory) eb.add('⛓️ ').bold('NEW FACTORY').add('  ').code(c.factoryOld).add(' → ').code(c.factoryNew).nl();
   if (c.newLaunches?.length) {
-    L.push(`\n🪙 <b>NEW LAUNCH</b>  factory count ${c.countOld} → ${c.countNew}`);
-    for (const l of c.newLaunches.slice(0, 4)) L.push(`  #${l.index}  market <code>${l.market}</code>\n       token <code>${l.token}</code>`);
+    eb.add('🪙 ').bold('NEW LAUNCH').add(`  factory count ${c.countOld} → ${c.countNew}`).nl();
+    for (const l of c.newLaunches.slice(0, 4)) { eb.add(`  #${l.index}  market `).code(l.market).nl(); eb.add('       token  ').code(l.token).nl(); }
   }
-  if (c.openingChange) L.push(`\n🕐 <b>NEW LAUNCH TIME</b>  ${esc(iso(c.openingChange.old))} → <b>${esc(iso(c.openingChange.new))}</b>`);
-  if (c.phaseChange) {
-    const nm = { 0: 'founding', 1: 'active (curve open)', 2: 'graduated' };
-    L.push(`\n🔓 <b>PHASE ${c.phaseChange.old} → ${c.phaseChange.new}</b>  ${esc(nm[c.phaseChange.new] || '')}`);
-  }
-  L.push('');
-  L.push(`<a href="${SITE}">${SITE.replace(/^https?:\/\//, '')}</a>`);
-  return L.join('\n');
+  if (c.openingChange) eb.add('🕐 ').bold('NEW LAUNCH TIME').add('  ').add(iso(c.openingChange.old)).add(' → ').bold(iso(c.openingChange.new)).nl();
+  if (c.phaseChange) eb.add('🔓 ').bold(`PHASE ${c.phaseChange.old} → ${c.phaseChange.new}`).add('  ').add(PHASE_LABEL[c.phaseChange.new] || '').nl();
+  return { built: eb.build(), replyMarkup: { inline_keyboard: [[{ text: '🌐 runup.fun', url: SITE }]] } };
 }
 
 function loadState() { try { return existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, 'utf8')) : null; } catch { return null; } }
@@ -205,9 +196,9 @@ async function main() {
 
   if (TEST) {
     const ev = { any: true, fe: { redeploy: true, indexOld: 'assets/index-OLD.js', indexNew: 'assets/index-NEW.js', convexLive: true, factory: '0xef1a648373dC19072D692429B704Bb63cf597950', quote: '0xa00C59fF5a080D2b954d0c75e46E22a0c371235a', chunkChanged: [{ name: 'v4Curve', new: 'assets/v4Curve-NEW.js' }], newAddrs: ['0x0C382e685bbeeFE5d3d9C29e29E341fEE8E84C5d'] }, ch: { newLaunches: [{ index: 1, market: '0x8399aF15A225314d7bE75BEeBf1E83D001380074', token: '0xe2906863a4Dc9261B1D0c25b5EF983C84130D893' }], countOld: 1, countNew: 2, openingChange: { old: 1790868600, new: 1790875800 } } };
-    const msg = buildMsg(ev);
-    console.log(msg);
-    const mid = await sendTelegram(msg, { chatId: CHAT });
+    const { built, replyMarkup } = buildMsg(ev);
+    console.log(built.text);
+    const mid = await sendAlert(built, { chatId: CHAT, replyMarkup });
     log(`test alert -> msg ${mid ?? 'FAILED'}`);
     return;
   }
@@ -224,8 +215,8 @@ async function main() {
       cur = await snapshot();
       const ev = diff(prev, cur);
       if (ev.any) {
-        const msg = buildMsg(ev);
-        const mid = await sendTelegram(msg, { chatId: CHAT });
+        const { built, replyMarkup } = buildMsg(ev);
+        const mid = await sendAlert(built, { chatId: CHAT, replyMarkup });
         log(`UPDATE -> msg ${mid ?? 'FAILED'} (fe.redeploy=${ev.fe.redeploy} chunks+${ev.fe.chunkAdded.length}/-${ev.fe.chunkRemoved.length}/~${ev.fe.chunkChanged.length} convex=${ev.fe.convexChanged} | chain: launch=${!!ev.ch.newLaunches} phase=${!!ev.ch.phaseChange} opening=${!!ev.ch.openingChange})`);
         saveState(cur);
       }

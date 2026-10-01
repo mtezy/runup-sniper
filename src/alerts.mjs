@@ -19,7 +19,8 @@
 import 'dotenv/config';
 import { createPublicClient, http, webSocket, fallback, defineChain, formatUnits } from 'viem';
 import { FACTORY_ABI, MARKET_ABI, ERC20_ABI } from './abi.mjs';
-import { sendTelegram, CHAT_ID, esc } from './notify.mjs';
+import { sendAlert, CHAT_ID } from './notify.mjs';
+import { EntityBuilder } from './eb.mjs';
 import { mcap } from './fmt.mjs';
 import { readMarketCap } from './curve.mjs';
 
@@ -95,40 +96,42 @@ function register(market, token, symbol) {
   markets.set(k, { market, token: token || cur?.token, symbol: symbol || cur?.symbol });
 }
 
-async function buildAlert({ index, creator, market, token, vault, schedule, adapter, leverage, shortThesis, profile, preset }) {
+// inline keyboard: runup.fun coin page + explorer (buttons > text links)
+function coinButtons(market) {
+  return { inline_keyboard: [[
+    { text: '📊 runup.fun', url: `https://runup.fun/coin/${market}` },
+    { text: '🔍 Explorer', url: `https://blockscout.injective.network/address/${market}` },
+  ]] };
+}
+
+async function buildAlert({ index, creator, market, token, leverage, shortThesis, profile, preset }) {
   const [meta, mk] = await Promise.all([tokenMeta(token), marketMeta(market)]);
   register(market, token, meta.symbol);
   const mc = await readMarketCap(pub, market).catch(() => null);
-  const price = mk.quote && mk.ticket ? `${fmtUsd(mk.ticket)} ${'USDC'} ticket` : '';
   const openTs = mk.opening && Number(mk.opening) > 0 ? new Date(Number(mk.opening) * 1000).toISOString().replace('.000Z', 'Z') : 'TBD';
   const name = meta.name || '(unknown)';
-  const sym = meta.symbol ? `$${meta.symbol}` : '';
+  const sym = meta.symbol || '';
   const side = shortThesis ? 'SHORT' : 'LONG';
   const unitStr = mc ? (mc.unit < 0.001 ? mc.unit.toPrecision(3) : mc.unit.toFixed(5)) + ' USDC/tok' : '';
+  const ticketTok = mk.ticketTokens ? Number(formatUnits(mk.ticketTokens, meta.decimals)).toLocaleString('en-US', { maximumFractionDigits: 0 }) : '?';
 
-  const lines = [];
-  lines.push(`🆕 <b>NEW RUNUP LAUNCH</b>  #${index}`);
-  lines.push('');
-  lines.push(`<b>${esc(name)}</b> ${esc(sym)}`);
-  if (meta.description) lines.push(`<i>${esc(meta.description)}</i>`);
-  if (meta.image) lines.push(`🖼 <a href="${meta.image}">artwork</a>`);
-  else if (meta.avatar) lines.push(`🖼 avatar  <code>${esc(meta.avatar)}</code>`);
-  lines.push(`market  <code>${market}</code>`);
-  lines.push(`token   <code>${token}</code>`);
-  lines.push(`creator <code>${creator}</code>`);
-  lines.push('');
-  if (mc) lines.push(`📊 <b>MC ${mcap(mc.cap)}</b>  ·  ${unitStr}`);
-  lines.push(`💵 ${esc(price)}  ·  ${mk.ticketTokens ? Number(formatUnits(mk.ticketTokens, meta.decimals)).toLocaleString('en-US', { maximumFractionDigits: 0 }) : '?'} tok`);
+  const eb = new EntityBuilder();
+  eb.add('🆕 ').bold(`NEW RUNUP LAUNCH  #${index}`).nl();
+  eb.bold(name).add(sym ? `  $${sym}` : '').nl();
+  if (mc) eb.add('• 📊 MC ').bold(mcap(mc.cap)).add(unitStr ? `  ·  ${unitStr}` : '').nl();
+  eb.add('• 💵 ').add(mk.ticket ? `${fmtUsd(mk.ticket)} USDC ticket` : 'ticket ?').add(`  ·  ${ticketTok} tok`).nl();
   if (Number(mk.phase) === 0 && mk.founderCap) {
     const sold = Number(mk.ticketsSold || 0), cap = Number(mk.founderCap);
-    lines.push(`🎟️ founding  <b>${sold}/${cap}</b>  (${((sold / cap) * 100).toFixed(1)}% sold — sold out → curve opens early)`);
+    eb.add('• 🎟️ founding ').bold(`${sold}/${cap}`).add(`  (${((sold / cap) * 100).toFixed(1)}% — sold out → early open)`).nl();
   }
-  if (mk.gradQuote && Number(mk.gradQuote) > 0) lines.push(`🎯 graduation  ~${fmtUsd(mk.gradQuote)} USDC`);
-  lines.push(`⚙️ ${esc(side)} ${leverage}× · preset ${preset} · profile ${profile} · fee ${(Number(mk.feeBps || 0) / 100).toFixed(2)}%`);
-  lines.push(`🕐 founding opens  ${esc(openTs)}  (public +1h)`);
-  lines.push('');
-  lines.push(`<a href="https://runup.fun/coin/${market}">runup.fun/coin/…</a>  ·  <a href="https://blockscout.injective.network/address/${market}">explorer</a>`);
-  return lines.join('\n');
+  if (mk.gradQuote && Number(mk.gradQuote) > 0) eb.add('• 🎯 graduation ').bold(`~${fmtUsd(mk.gradQuote)} USDC`).nl();
+  eb.add(`• ⚙️ ${side} ${leverage}× · preset ${preset} · profile ${profile} · fee ${(Number(mk.feeBps || 0) / 100).toFixed(2)}%`).nl();
+  eb.add('• 🕐 opens ').bold(openTs).add('  (public +1h)').nl();
+  if (meta.description) eb.add('↪ ').italic(`"${meta.description}"`).nl();
+  eb.add('market ').code(market).nl();
+  eb.add('token  ').code(token).nl();
+  if (creator) eb.add('creator ').code(creator).nl();
+  return { built: eb.build(), imageUrl: meta.image || null, replyMarkup: coinButtons(market) };
 }
 
 // ---------- dispatch ----------
@@ -138,20 +141,17 @@ async function handleLaunch(args, tag) {
   if (seen.has(idx)) return;
   seen.add(idx);
   try {
-    const msg = await buildAlert({
+    const { built, imageUrl, replyMarkup } = await buildAlert({
       index: idx,
       creator: args.creator,
       market: args.market,
       token: args.token,
-      vault: args.vault,
-      schedule: args.schedule,
-      adapter: args.adapter,
       leverage: args.leverage,
       shortThesis: args.shortThesis,
       profile: args.profile,
       preset: args.preset,
     });
-    const mid = await sendTelegram(msg, { chatId: CHAT });
+    const mid = await sendAlert(built, { chatId: CHAT, imageUrl, replyMarkup });
     log(`alert #${idx} ${args.token.slice(0, 10)} (${tag}) -> msg ${mid ?? 'FAILED'}`);
   } catch (e) {
     log(`alert #${idx} err: ${e.shortMessage || e.message}`);
@@ -198,30 +198,27 @@ async function surgeMsg(m, from, to, pct, mins, hist) {
   const name = meta.name || '(unknown)';
   const sym = meta.symbol || m.symbol || '';
   const ph = rich?.phase != null ? Number(rich.phase) : null;
-  const L = [];
-  L.push(`🚀 <b>MC SURGE</b>  <b>${esc(name)}</b> ${sym ? '$' + esc(sym) : ''}`);
-  if (meta.description) L.push(`<i>${esc(meta.description)}</i>`);
-  L.push('');
-  L.push(`📈 <b>${mcap(from)} → ${mcap(to)}</b>  (<b>+${pct.toFixed(0)}%</b> in ${mins}m)`);
-  if (hist && hist.length > 1) L.push(`<code>${spark(hist)}</code>  <i>${mcap(Math.min(...hist))} – ${mcap(Math.max(...hist))}</i>`);
-  if (rich?.mc) L.push(`💲 price  ${rich.mc.unit < 0.001 ? rich.mc.unit.toPrecision(3) : rich.mc.unit.toFixed(6)} USDC/tok`);
-  if (ph != null) L.push(`⚙️ phase  ${ph} · ${esc(PHASE_NAME[ph] || '?')}`);
+
+  const eb = new EntityBuilder();
+  eb.add('🚀 ').bold('MC SURGE').add('  ').bold(name).add(sym ? `  $${sym}` : '').nl();
+  eb.add('• 📈 ').bold(`${mcap(from)} → ${mcap(to)}`).add('  ').bold(`+${pct.toFixed(0)}%`).add(` in ${mins}m`).nl();
+  if (hist && hist.length > 1) eb.code(spark(hist)).add(`  ${mcap(Math.min(...hist))} – ${mcap(Math.max(...hist))}`).nl();
+  if (rich?.mc) eb.add(`• 💲 ${rich.mc.unit < 0.001 ? rich.mc.unit.toPrecision(3) : rich.mc.unit.toFixed(6)} USDC/tok`).nl();
+  if (ph != null) eb.add(`• ⚙️ phase ${ph} · ${PHASE_NAME[ph] || '?'}`).nl();
   if (ph === 0 && rich?.founderCap) {
     const sold = Number(rich.ticketsSold || 0), cap = Number(rich.founderCap);
-    L.push(`🎟️ founding  <b>${sold}/${cap}</b>  (${((sold / cap) * 100).toFixed(1)}% — sold out → early open)`);
+    eb.add('• 🎟️ founding ').bold(`${sold}/${cap}`).add(`  (${((sold / cap) * 100).toFixed(1)}% — sold out → early open)`).nl();
   }
   if (rich?.realQuote != null && rich?.gradQuote != null && Number(rich.gradQuote) > 0) {
     const rq = usdN(rich.realQuote), gq = usdN(rich.gradQuote);
-    L.push(`💧 curve  ${usdFmt(rq)} / ${usdFmt(gq)} USDC  (${((rq / gq) * 100).toFixed(1)}% to grad)`);
+    eb.add('• 💧 curve ').bold(`${usdFmt(rq)} / ${usdFmt(gq)}`).add(` USDC  (${((rq / gq) * 100).toFixed(1)}% to grad)`).nl();
   }
-  if (rich?.feeBps) L.push(`🧾 fee  ${(Number(rich.feeBps) / 100).toFixed(2)}%`);
-  L.push('');
-  L.push(`market  <code>${m.market}</code>`);
-  if (m.token) L.push(`token   <code>${m.token}</code>`);
-  if (rich?.creator) L.push(`creator <code>${rich.creator}</code>`);
-  L.push('');
-  L.push(`<a href="https://runup.fun/coin/${m.market}">runup.fun/coin/…</a>  ·  <a href="https://blockscout.injective.network/address/${m.market}">explorer</a>`);
-  return L.join('\n');
+  if (rich?.feeBps) eb.add(`• 🧾 fee ${(Number(rich.feeBps) / 100).toFixed(2)}%`).nl();
+  if (meta.description) eb.add('↪ ').italic(`"${meta.description}"`).nl();
+  eb.add('market ').code(m.market).nl();
+  if (m.token) eb.add('token  ').code(m.token).nl();
+  if (rich?.creator) eb.add('creator ').code(rich.creator).nl();
+  return { built: eb.build(), imageUrl: meta.image || null, replyMarkup: coinButtons(m.market) };
 }
 
 async function surgeTick() {
@@ -249,8 +246,8 @@ async function surgeTick() {
         lastSurge.set(key, now);
         const mins = Math.max(1, Math.round((now - base.t) / 60000));
         const hist = arr.filter(s => s.t >= target).map(s => s.mc);
-        const msg = await surgeMsg(m, base.mc, mc.cap, pct, mins, hist);
-        const mid = await sendTelegram(msg, { chatId: CHAT });
+        const { built, imageUrl, replyMarkup } = await surgeMsg(m, base.mc, mc.cap, pct, mins, hist);
+        const mid = await sendAlert(built, { chatId: CHAT, imageUrl, replyMarkup });
         log(`surge ${m.symbol || key.slice(0, 8)} +${pct.toFixed(0)}% (${mcap(base.mc)}→${mcap(mc.cap)}) -> msg ${mid ?? 'FAILED'}`);
       }
     } catch (e) { log('surge err', e.shortMessage || e.message); }
@@ -272,14 +269,16 @@ async function curveTick() {
       if (phase === null) continue;
       const ph = Number(phase);
       const prev = lastPhase.get(key);
-      const sym = m.symbol ? '$' + esc(m.symbol) : 'token';
+      const sym = m.symbol ? '$' + m.symbol : 'token';
 
       // phase 0 -> 1 : the public curve just opened (early on SOLD OUT, or on schedule)
       if (prev === 0 && ph >= 1) {
-        const msg = [`🔓 <b>CURVE OPEN</b>  ${sym}`, '', `public curve is live — phase 0 → ${ph}`,
-          `market  <code>${m.market}</code>`, m.token ? `token   <code>${m.token}</code>` : '',
-          '', `<a href="https://runup.fun/coin/${m.market}">runup.fun/coin/…</a>`].filter(Boolean).join('\n');
-        const mid = await sendTelegram(msg, { chatId: CHAT });
+        const eb = new EntityBuilder();
+        eb.add('🔓 ').bold('CURVE OPEN').add('  ').bold(sym).nl();
+        eb.add(`• public curve is live — phase 0 → ${ph}`).nl();
+        eb.add('market ').code(m.market).nl();
+        if (m.token) eb.add('token  ').code(m.token).nl();
+        const mid = await sendAlert(eb.build(), { chatId: CHAT, replyMarkup: coinButtons(m.market) });
         log(`curve open ${m.symbol || key.slice(0, 8)} -> msg ${mid ?? 'FAILED'}`);
       }
       // founding milestones (90% / sold out) while still phase 0
@@ -290,11 +289,12 @@ async function curveTick() {
           if (pct >= mark && !pinged.has(mark)) {
             pinged.add(mark);
             foundingPinged.set(key, pinged);
-            const head = mark >= 100 ? '🔥 <b>FOUNDING SOLD OUT</b>' : '⚠️ <b>FOUNDING 90%</b>';
-            const msg = [head + '  ' + sym, '', `tickets  <b>${Number(sold)}/${Number(cap)}</b>  (${pct.toFixed(1)}%)`,
-              mark >= 100 ? 'curve opens imminently' : 'nearly full — curve opens early on sell-out',
-              `market  <code>${m.market}</code>`, '', `<a href="https://runup.fun/coin/${m.market}">runup.fun/coin/…</a>`].join('\n');
-            const mid = await sendTelegram(msg, { chatId: CHAT });
+            const eb = new EntityBuilder();
+            eb.add(mark >= 100 ? '🔥 ' : '⚠️ ').bold(mark >= 100 ? 'FOUNDING SOLD OUT' : 'FOUNDING 90%').add('  ').bold(sym).nl();
+            eb.add('• tickets ').bold(`${Number(sold)}/${Number(cap)}`).add(`  (${pct.toFixed(1)}%)`).nl();
+            eb.add(mark >= 100 ? '• curve opens imminently' : '• nearly full — curve opens early on sell-out').nl();
+            eb.add('market ').code(m.market).nl();
+            const mid = await sendAlert(eb.build(), { chatId: CHAT, replyMarkup: coinButtons(m.market) });
             log(`founding ${mark}% ${m.symbol || key.slice(0, 8)} (${sold}/${cap}) -> msg ${mid ?? 'FAILED'}`);
           }
         }
@@ -312,9 +312,9 @@ async function main() {
     const n = Number(await pub.readContract({ address: FACTORY, abi: FACTORY_ABI, functionName: 'count' }).catch(() => 0));
     const i = Math.max(0, n - 1);
     const r = await pub.readContract({ address: FACTORY, abi: FACTORY_ABI, functionName: 'launches', args: [BigInt(i)] });
-    const msg = await buildAlert({ index: i, creator: r[5], market: r[1], token: r[0], vault: r[2], schedule: r[3], adapter: r[4], leverage: r[8], shortThesis: r[7], profile: r[9], preset: r[10] });
-    console.log(msg);
-    const mid = await sendTelegram(msg, { chatId: CHAT });
+    const { built, imageUrl, replyMarkup } = await buildAlert({ index: i, creator: r[5], market: r[1], token: r[0], leverage: r[8], shortThesis: r[7], profile: r[9], preset: r[10] });
+    console.log(built.text);
+    const mid = await sendAlert(built, { chatId: CHAT, imageUrl, replyMarkup });
     log(`test alert -> msg ${mid ?? 'FAILED'}`);
     return;
   }
@@ -327,9 +327,9 @@ async function main() {
     const mc = await readMarketCap(pub, m.market).catch(() => null);
     const to = mc ? mc.cap : 1500, from = to / 1.5;
     const hist = [from, from * 1.05, from * 1.12, from * 1.25, from * 1.33, to];
-    const msg = await surgeMsg(m, from, to, 50, 5, hist);
-    console.log(msg);
-    const mid = await sendTelegram(msg, { chatId: CHAT });
+    const { built, imageUrl, replyMarkup } = await surgeMsg(m, from, to, 50, 5, hist);
+    console.log(built.text);
+    const mid = await sendAlert(built, { chatId: CHAT, imageUrl, replyMarkup });
     log(`test surge -> msg ${mid ?? 'FAILED'}`);
     return;
   }
