@@ -233,10 +233,6 @@ PRIVATE_KEYS=0xKEY1:20,0xKEY2:440            # KEY:AMOUNT (USDC per wallet)
 - Comma-separated, prefix `0x` opsional, 64 hex
 - EOA (bukan mnemonic)
 
-### Fleet saat ini (11 wallet, RUNNER)
-- 10 wallet sniper: @20 USDC (21 USDC saldo, 0.2 INJ gas)
-- 1 funder `0xCC475ea8…`: @440 USDC (460 USDC saldo, 2.02 INJ)
-- Semua **11/11 approved** ke market RUNNER
 
 ---
 
@@ -292,11 +288,3 @@ Hasil: buy 20 USDC → 19,800 tok → sell all → 19.8 USDC. MC `$0 → $20 →
 
 ---
 
-## 10. Status (per 2026-10-01)
-
-```
-screen runup-alerts   → watcher v3 (launch + surge) AKTIF
-sniper                → 11/11 ready, nunggu public curve 16:30 UTC
-RUNNER MC             → $23.9K
-Funder                → 460 USDC (cukup 440) + 2.02 INJ
-```
