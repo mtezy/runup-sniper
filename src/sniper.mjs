@@ -73,7 +73,8 @@ const SLIPPAGE_BPS = BigInt(opt('slippage', process.env.SLIPPAGE_BPS || 3000));
 const MAX_FEE_GWEI = opt('maxfee', process.env.MAX_FEE_GWEI || '');
 const PRIORITY_GWEI = opt('priority', process.env.PRIORITY_GWEI || '');
 const POLL_MS = Number(opt('poll', process.env.POLL_MS || 250));
-const LEAD_MS = Number(opt('lead', process.env.LEAD_MS || 400));          // fire this early vs open
+const LEAD_MS = Number(opt('lead', process.env.LEAD_MS || 400));          // pre-roll the tight loop this early
+const TIMER_TICK_MS = Number(opt('tick', process.env.TIMER_TICK_MS || 20)); // tight-loop / near-open poll granularity
 // `opening()` = the FOUNDING start. The PUBLIC curve opens OPEN_DELAY_S later (V4 platform founding
 // duration = 1h = 3600s). Set OPEN_DELAY_S=3600 to snipe a founding market's public-curve open.
 const OPEN_DELAY_S = Number(opt('openDelay', process.env.OPEN_DELAY_S || 0));
@@ -657,35 +658,54 @@ async function cmdSnipe() {
   // ---- timer layer: fire LEAD_MS before the PUBLIC CURVE opens ----
   // `opening()` = founding start; public opens at opening + OPEN_DELAY_S (default 0; 3600 for a
   // founding market). The trigger re-checks phase so a mis-timed wake never burns the shot.
-  if (s.opening && Number(s.opening) > 0) {
-    const openMs = (Number(s.opening) + OPEN_DELAY_S) * 1000;
+  // The pre-roll (LEAD_MS) just warms the tight loop before the open — it never fires early.
+  const openMs = (s.opening && Number(s.opening) > 0) ? (Number(s.opening) + OPEN_DELAY_S) * 1000 : 0;
+  if (openMs) {
     const delay = openMs - LEAD_MS - Date.now();
     log(`public curve opens at ${new Date(openMs).toISOString()} (opening+${OPEN_DELAY_S}s, lead ${LEAD_MS}ms, in ${Math.round(delay / 1000)}s)`);
     const timerTrigger = async () => {
-      const until = Date.now() + 6000;            // tight-poll window after the scheduled time
+      const until = Date.now() + 8000;            // tight-poll window straddling the scheduled time
       while (Date.now() < until) {
         if (fired) return;
-        try { const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' }); if (Number(p) >= 1) return triggerOnce('timer:open'); } catch {}
-        await sleep(40);
+        try {
+          const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' });
+          const a = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'active' });
+          if (Number(p) >= 1 || a === true) return triggerOnce('timer:open');
+        } catch {}
+        await sleep(TIMER_TICK_MS);
       }
       log('timer window elapsed, phase still <1 — relying on WS/poll');
     };
-    if (delay <= 0) await timerTrigger();
+    if (delay <= 0) timerTrigger();
     else { const t = setTimeout(timerTrigger, delay); cleanups.push(() => clearTimeout(t)); }
   }
 
-  // ---- poll fallback (always on; cheap) ----
-  let last = s.phase;
-  const pollIv = setInterval(async () => {
-    if (fired) return;
-    try {
-      const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' });
-      const a = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'active' });
-      if (p === 1 || a === true) return triggerOnce(`poll:phase ${last}->${p}`);
-      if (p !== last) { log(`phase ${last} -> ${p}`); last = p; }
-    } catch {}
-  }, POLL_MS);
-  cleanups.push(() => clearInterval(pollIv));
+  // ---- poll fallback (ADAPTIVE: cheap when far, tight near the open) ----
+  // Fixed-interval polling is either too slow at the open or wasteful for an hour. Ramp instead:
+  // >60s out = slow; last 60s = 100ms; last ~5s / straddling the open = TIMER_TICK_MS. WS is still
+  // primary; this only governs the fallback channel.
+  let last = s.phase, pollStopped = false;
+  const pollLoop = async () => {
+    while (!fired && !pollStopped) {
+      let iv = POLL_MS;
+      if (openMs) {
+        const untilOpen = openMs - Date.now();
+        if (untilOpen > 60000) iv = Math.max(POLL_MS, 2000);
+        else if (untilOpen > 5000) iv = 100;
+        else if (untilOpen > -8000) iv = TIMER_TICK_MS;   // tight across the open
+        else iv = Math.max(POLL_MS, 250);
+      }
+      try {
+        const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' });
+        const a = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'active' });
+        if (Number(p) >= 1 || a === true) { triggerOnce(`poll:phase ${last}->${p} active=${a}`); return; }
+        if (p !== last) { log(`phase ${last} -> ${p}`); last = p; }
+      } catch {}
+      await sleep(iv);
+    }
+  };
+  pollLoop();
+  cleanups.push(() => { pollStopped = true; });
 
   // ---- heartbeat ----
   const hbIv = setInterval(async () => {
