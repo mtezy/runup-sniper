@@ -81,7 +81,8 @@ const OPEN_DELAY_S = Number(opt('openDelay', process.env.OPEN_DELAY_S || 0));
 // must still be valid at fire time → set DEADLINE_S to cover the wait (e.g. 7200 = 2h).
 const DEADLINE_S = Number(opt('deadline', process.env.DEADLINE_S || 600));
 const DRY_RUN = flag('dry') || String(process.env.DRY_RUN).toLowerCase() === 'true';
-const BLAST = Number(opt('blast', process.env.BLAST || 1));               // send N copies (nonce+1..)
+const BLAST = Number(opt('blast', process.env.BLAST || 1));               // send N blasts: nonce, nonce+1, ...
+const BLAST_STEP_GWEI = opt('blastStep', process.env.BLAST_STEP_GWEI || '0'); // priority bump per blast
 const KEYS = (opt('keys', process.env.PRIVATE_KEYS || process.env.PRIVATE_KEY || '')).split(',').map(s => s.trim()).filter(Boolean);
 
 // Build an HTTP transport: single url, or a viem `fallback` chain that rotates on RPC failure.
@@ -152,7 +153,7 @@ async function tokenInfo(token) {
 }
 
 // ---------- arming ----------
-async function arm(market, w, { nonce, fees, amount, deadline } = {}) {
+async function arm(market, w, { nonce, fees, amount, deadline, blasts } = {}) {
   const account = w.account;
   const amt = amount ?? w.amount ?? AMOUNT;
   const maximum = parseUnits(String(amt), QUOTE_DECIMALS);
@@ -164,12 +165,24 @@ async function arm(market, w, { nonce, fees, amount, deadline } = {}) {
   } catch { /* curve not quoted yet — min 0 */ }
   const dl = BigInt(deadline ?? (now() + DEADLINE_S));
   const data = encodeFunctionData({ abi: MARKET_ABI, functionName: 'buy', args: [maximum, minimum, account.address, dl, true] });
-  const nonceV = nonce ?? await pub.getTransactionCount({ address: account.address, blockTag: 'pending' });
+  const baseNonce = BigInt(nonce ?? await pub.getTransactionCount({ address: account.address, blockTag: 'pending' }));
   let gas;
-  try { gas = (await pub.estimateGas({ account, to: market, data, value: 0n })) * 120n / 100n; } catch { gas = 900000n; }
-  const tx = { account, to: market, data, value: 0n, chain, gas, nonce: nonceV, ...fees };
-  const serialized = await w.wallet.signTransaction(tx);
-  return { tx, serialized, maximum, minimum, deadline: dl };
+  try { gas = (await pub.estimateGas({ account, to: market, data, value: 0n })) * 130n / 100n; } catch { gas = 900000n; }
+  // Pre-sign BLAST txs with SEQUENTIAL nonces (nonce, nonce+1, ...). Firing them all in parallel
+  // sprays consecutive blocks: if the curve is still phase 0 when blast#1 lands (revert, nonce burns),
+  // blast#2 lands in the next block (phase 1) and wins. BLAST_STEP_GWEI bumps priority per blast so the
+  // later shots jump the mempool queue once their nonce is next.
+  const N = Math.max(1, blasts ?? BLAST);
+  const step = BLAST_STEP_GWEI ? parseUnits(BLAST_STEP_GWEI, 9) : 0n;
+  const signed = [];
+  for (let i = 0; i < N; i++) {
+    const f = { ...fees };
+    if (step > 0n && f.maxPriorityFeePerGas != null) f.maxPriorityFeePerGas = f.maxPriorityFeePerGas + BigInt(i) * step;
+    if (step > 0n && f.maxFeePerGas != null) f.maxFeePerGas = f.maxFeePerGas + BigInt(i) * step;
+    const tx = { account, to: market, data, value: 0n, chain, gas, nonce: baseNonce + BigInt(i), ...f };
+    signed.push({ serialized: await w.wallet.signTransaction(tx), tx });
+  }
+  return { signed, maximum, minimum, deadline: dl, nonces: signed.map(s => s.tx.nonce) };
 }
 
 async function fees() {
@@ -202,20 +215,23 @@ async function ensureApproval(w, market, amount) {
 // ---------- fire ----------
 async function fire(market, armed, w, rearm) {
   const label = w.account.address.slice(0, 10);
-  if (DRY_RUN) { log(`[DRY] would buy on ${market} wallet ${label} max=${formatUnits(armed.maximum, QUOTE_DECIMALS)} min=${armed.minimum}`); return null; }
+  if (DRY_RUN) { log(`[DRY] would buy on ${market} wallet ${label} max=${formatUnits(armed.maximum, QUOTE_DECIMALS)} min=${armed.minimum} blasts=${armed.signed.length}`); return []; }
   const hashes = [];
-  for (let i = 0; i < Math.max(1, BLAST); i++) {
+  // Broadcast ALL blasts IN PARALLEL — the fastest path to the next block. Nonces are sequential so
+  // they queue in order; a lower blast that lands while phase 0 just reverts and the next one lands.
+  const sends = armed.signed.map(async (s, i) => {
     try {
-      const h = await pub.sendRawTransaction({ serializedTransaction: armed.serialized });
+      const h = await pub.sendRawTransaction({ serializedTransaction: s.serialized });
       hashes.push(h);
-      log(`FIRED ${label} blast#${i + 1} -> ${h}`);
+      log(`FIRED ${label} blast#${i + 1} nonce=${s.tx.nonce} -> ${h}`);
+      return h;
     } catch (e) {
       const msg = `${e.details || ''} ${e.shortMessage || ''} ${e.message || ''}`.toLowerCase();
-      if ((msg.includes('nonce') || msg.includes('deadline') || msg.includes('expired')) && rearm) {
+      if ((msg.includes('nonce') || msg.includes('deadline') || msg.includes('expired')) && rearm && i === 0) {
         log(`${msg.includes('nonce') ? 'nonce stale' : 'deadline/expired'} for ${label}, re-arming fresh...`);
         try {
           const fresh = await rearm(w);
-          const h = await pub.sendRawTransaction({ serializedTransaction: fresh.serialized });
+          const h = await pub.sendRawTransaction({ serializedTransaction: fresh.signed[0].serialized });
           hashes.push(h);
           log(`FIRED ${label} (renonce) -> ${h}`);
         } catch (e2) { log(`fire err ${label} renonce: ${e2.details || e2.shortMessage || e2.message}`); }
@@ -223,8 +239,10 @@ async function fire(market, armed, w, rearm) {
         log(`fire err ${label} #${i + 1}: ${e.shortMessage || e.message}`);
         if (e.details) log(`   details: ${e.details}`);
       }
+      return null;
     }
-  }
+  });
+  await Promise.all(sends);
   return hashes;
 }
 
@@ -586,7 +604,7 @@ async function cmdSnipe() {
       catch (e) { log('arm err', w.account.address.slice(0, 10), e.shortMessage || e.message); return null; }
     }));
     for (const r of results) if (r) armed[r[0]] = r[1];
-    log(`armed ${Object.keys(armed).length} wallet(s)  deadline=${new Date(armDeadline * 1000).toISOString()}`);
+    log(`armed ${Object.keys(armed).length} wallet(s)  deadline=${new Date(armDeadline * 1000).toISOString()}  blasts/wallet=${BLAST}`);
   };
   await doArm();
 
@@ -594,8 +612,11 @@ async function cmdSnipe() {
   const triggerOnce = async (why) => {
     if (fired) return; fired = true; reason = why;
     log(`>>> TRIGGER (${why}) at ${now()}`);
-    const rearm = async (w) => { const a = await arm(market, w, { fees: baseFees, amount: w.amount }); armed[w.account.address] = a; return a; };
-    await Promise.all(Object.values(armed).map(a => fire(market, a, ws.find(w => w.account.address === a.tx.account.address), rearm)));
+    const rearm = async (w) => { const a = await arm(market, w, { fees: baseFees, amount: w.amount, blasts: BLAST }); armed[w.account.address] = a; return a; };
+    await Promise.all(Object.entries(armed).map(([addr, a]) => {
+      const w = ws.find(x => x.account.address === addr);
+      return w ? fire(market, a, w, rearm) : null;
+    }));
   };
 
   // Already open at start?
@@ -676,6 +697,22 @@ async function cmdSnipe() {
   while (!fired) await sleep(150);
   for (const c of cleanups) { try { c?.(); } catch {} }
   log(`snipe finished (${reason})`);
+
+  // ---- post-fire confirmation: did any wallet actually receive tokens (= won the race)? ----
+  if (!DRY_RUN) {
+    try {
+      const tok = s.token || (await marketState(market)).token;
+      await sleep(6000);
+      let won = 0; let total = 0n;
+      for (const w of ws) {
+        try {
+          const b = await pub.readContract({ address: tok, abi: ERC20_ABI, functionName: 'balanceOf', args: [w.account.address] });
+          if (b > 0n) { won++; total += b; log(`  ✓ ${w.account.address.slice(0, 10)} got ${formatUnits(b, 18)} tokens`); }
+        } catch {}
+      }
+      log(`CONFIRM: ${won}/${ws.length} wallet(s) received tokens (total ${formatUnits(total, 18)})`);
+    } catch (e) { log('confirm err', e.message); }
+  }
 }
 
 async function cmdConfig() {
