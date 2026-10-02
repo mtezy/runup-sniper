@@ -121,6 +121,23 @@ async function newestMarket(factory) {
   return (await factoryLaunch(factory, n - 1)).market;
 }
 
+// ---------- fresh phase read ----------
+// Some RPCs (observed: Alchemy on Injective) CACHE `eth_blockNumber` and `eth_call` with the default
+// 'latest' tag for several seconds — a read that should flip instantly can appear stale for ~4s. But
+// `eth_getBlockByNumber('latest')` IS fresh (~0.6s). So anchor the read to an explicit, just-fetched
+// head block: get the fresh head, then evaluate phase()/active() AT that block number. This forces a
+// fresh evaluation even when 'latest' is cached.
+async function readPhaseFresh(market, client = pub) {
+  try {
+    const head = (await client.getBlock({ blockTag: 'latest' })).number;
+    const [p, a] = await Promise.all([
+      client.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase', blockNumber: head }),
+      client.readContract({ address: market, abi: MARKET_ABI, functionName: 'active', blockNumber: head }),
+    ]);
+    return { phase: Number(p), active: a === true, block: head };
+  } catch { return null; }
+}
+
 // ---------- market state ----------
 async function marketState(market) {
   const [phase, active, opening, realQuote, realTokens, gradQuote, tSold, founderCap, ticket, ticketTokens, token, quote] = await Promise.all([
@@ -641,12 +658,18 @@ async function cmdSnipe() {
         address: market, abi: MARKET_ABI, eventName: 'FoundingFinalized',
         onLogs: async () => {
           log('ws:FoundingFinalized — founding closed');
-          try { const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' }); if (Number(p) >= 1) triggerOnce('ws:FoundingFinalized'); else log('phase still 0 after FoundingFinalized — waiting for phase 1'); } catch {}
+          const st = await readPhaseFresh(market);
+          if (st && st.phase >= 1) triggerOnce('ws:FoundingFinalized'); else log('phase still 0 after FoundingFinalized — waiting for phase 1');
         },
         onError: (e) => log('ws finalize err', e.message),
       }));
       cleanups.push(wspub.watchBlocks({
-        onBlock: async () => { try { const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' }); if (p === 1) triggerOnce('ws:phase=1'); } catch {} },
+        onBlock: async (b) => {
+          try {
+            const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase', blockNumber: b.number });
+            if (Number(p) >= 1) triggerOnce('ws:phase=1');
+          } catch {}
+        },
         onError: (e) => log('ws head err', e.message),
       }));
       log(`WS armed: ${WS_URL} (CurveOpened + FoundingFinalized + newHeads)`);
@@ -667,11 +690,8 @@ async function cmdSnipe() {
       const until = Date.now() + 8000;            // tight-poll window straddling the scheduled time
       while (Date.now() < until) {
         if (fired) return;
-        try {
-          const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' });
-          const a = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'active' });
-          if (Number(p) >= 1 || a === true) return triggerOnce('timer:open');
-        } catch {}
+        const st = await readPhaseFresh(market);
+        if (st && (st.phase >= 1 || st.active)) return triggerOnce('timer:open');
         await sleep(TIMER_TICK_MS);
       }
       log('timer window elapsed, phase still <1 — relying on WS/poll');
@@ -695,12 +715,11 @@ async function cmdSnipe() {
         else if (untilOpen > -8000) iv = TIMER_TICK_MS;   // tight across the open
         else iv = Math.max(POLL_MS, 250);
       }
-      try {
-        const p = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'phase' });
-        const a = await pub.readContract({ address: market, abi: MARKET_ABI, functionName: 'active' });
-        if (Number(p) >= 1 || a === true) { triggerOnce(`poll:phase ${last}->${p} active=${a}`); return; }
-        if (p !== last) { log(`phase ${last} -> ${p}`); last = p; }
-      } catch {}
+      const st = await readPhaseFresh(market);
+      if (st) {
+        if (st.phase >= 1 || st.active) { triggerOnce(`poll:phase ${last}->${st.phase} active=${st.active}`); return; }
+        if (st.phase !== last) { log(`phase ${last} -> ${st.phase}`); last = st.phase; }
+      }
       await sleep(iv);
     }
   };
